@@ -11,11 +11,11 @@ from enum import Enum
 from discord import Webhook, RequestsWebhookAdapter
 
 
-CIRCL_LU_URL = "https://cve.circl.lu/api/query"
+CIRCL_LU_URL = "https://cve.circl.lu/api/vulnerability/last"
 CVES_JSON_PATH = join(pathlib.Path(__file__).parent.absolute(), "output/botpeas.json")
-LAST_NEW_CVE = datetime.datetime.now() - datetime.timedelta(days=1)
-LAST_MODIFIED_CVE = datetime.datetime.now() - datetime.timedelta(days=1)
-TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+LAST_NEW_CVE = datetime.datetime.now() - datetime.timedelta(days=2)
+LAST_MODIFIED_CVE = datetime.datetime.now() - datetime.timedelta(days=2)
+TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 KEYWORDS_CONFIG_PATH = join(pathlib.Path(__file__).parent.absolute(), "config/botpeas.yaml")
 ALL_VALID = False
@@ -26,8 +26,8 @@ PRODUCT_KEYWORDS = []
 
 
 class Time_Type(Enum):
-    PUBLISHED = "Published"
-    LAST_MODIFIED = "last-modified"
+    PUBLISHED = "datePublished"
+    LAST_MODIFIED = "dateUpdated"
 
 
 ################## LOAD CONFIGURATIONS ####################
@@ -86,17 +86,8 @@ def update_lasttimes():
 ################## SEARCH CVES ####################
 
 def get_cves(tt_filter:Time_Type) -> dict:
-    ''' Given the headers for the API retrive CVEs from cve.circl.lu '''
-    now = datetime.datetime.now() - datetime.timedelta(days=1)
-    now_str = now.strftime("%d-%m-%Y")
-
-    headers = {
-        "time_modifier": "from",
-        "time_start": now_str,
-        "time_type": tt_filter.value,
-        "limit": "100",
-    }
-    r = requests.get(CIRCL_LU_URL, headers=headers)
+    ''' Retrive CVEs from cve.circl.lu '''
+    r = requests.get(CIRCL_LU_URL)
 
     return r.json()
 
@@ -108,7 +99,7 @@ def get_new_cves() -> list:
 
     cves = get_cves(Time_Type.PUBLISHED)
     filtered_cves, new_last_time = filter_cves(
-            cves["results"],
+            cves,
             LAST_NEW_CVE,
             Time_Type.PUBLISHED
         )
@@ -124,7 +115,7 @@ def get_modified_cves() -> list:
 
     cves = get_cves(Time_Type.LAST_MODIFIED)
     filtered_cves, new_last_time = filter_cves(
-            cves["results"],
+            cves,
             LAST_MODIFIED_CVE,
             Time_Type.PUBLISHED
         )
@@ -140,15 +131,19 @@ def filter_cves(cves: list, last_time: datetime.datetime, tt_filter: Time_Type) 
     new_last_time = last_time
 
     for cve in cves:
-        cve_time = datetime.datetime.strptime(cve[tt_filter.value], TIME_FORMAT)
-        if cve_time > last_time:
-            if ALL_VALID or is_summ_keyword_present(cve["summary"]) or \
-                is_prod_keyword_present(str(cve["vulnerable_configuration"])):
-                
-                filtered_cves.append(cve)
+        try:
+            cve_time = datetime.datetime.strptime(cve["cveMetadata"][tt_filter.value], TIME_FORMAT)
+            cve_prod = str(cve["containers"]["cna"]["affected"])
+            if cve_time > last_time:
+                if ALL_VALID or is_summ_keyword_present(cve["containers"]["cna"]["descriptions"][0]["value"]) or \
+                    is_prod_keyword_present(cve_prod):
 
-        if cve_time > new_last_time:
-            new_last_time = cve_time
+                    filtered_cves.append(cve)
+
+            if cve_time > new_last_time:
+                new_last_time = cve_time
+        except Exception as e:
+            pass
 
     return filtered_cves, new_last_time
 
@@ -191,16 +186,16 @@ def search_exploits(cve: str) -> list:
 def generate_new_cve_message(cve_data: dict) -> str:
     ''' Generate new CVE message for sending to slack '''
 
-    message = f"🚨  *{cve_data['id']}*  🚨\n"
-    message += f"🔮  *CVSS*: {cve_data['cvss']}\n"
-    message += f"📅  *Published*: {cve_data['Published']}\n"
+    message = f"🚨  *{cve_data["cveMetadata"]['cveId']}*  🚨\n"
+    # message += f"🔮  *CVSS*: {cve_data['cvss']}\n"
+    message += f"📅  *Published*: {cve_data['cveMetadata']["datePublished"]}\n"
     message += "📓  *Summary*: " 
-    message += cve_data["summary"] if len(cve_data["summary"]) < 500 else cve_data["summary"][:500] + "..."
+    message += cve_data["containers"]["cna"]["descriptions"][0]["value"] if len(cve_data["containers"]["cna"]["descriptions"][0]["value"]) < 500 else cve_data["containers"]["cna"]["descriptions"][0]["value"][:500] + "..."
     
-    if cve_data["vulnerable_configuration"]:
-        message += f"\n🔓  *Vulnerable* (_limit to 10_): " + ", ".join(cve_data["vulnerable_configuration"][:10])
+    # if cve_data["vulnerable_configuration"]:
+    #     message += f"\n🔓  *Vulnerable* (_limit to 10_): " + ", ".join(cve_data["vulnerable_configuration"][:10])
     
-    message += "\n\n🟢 ℹ️  *More information* (_limit to 5_)\n" + "\n".join(cve_data["references"][:5])
+    # message += "\n\n🟢 ℹ️  *More information* (_limit to 5_)\n" + "\n".join(cve_data["containers"]["cna"]["references"][:5])
     
     message += "\n"
 
@@ -387,11 +382,12 @@ def main():
     #Find a publish new CVEs
     new_cves = get_new_cves()
 
-    new_cves_ids = [ncve['id'] for ncve in new_cves]
+    new_cves_ids = [ncve["cveMetadata"]['cveId'] for ncve in new_cves]
     print(f"New CVEs discovered: {new_cves_ids}")
 
     for new_cve in new_cves:
-        public_exploits = search_exploits(new_cve['id'])
+        # public_exploits = search_exploits(new_cve['id'])
+        public_exploits = []
         cve_message = generate_new_cve_message(new_cve)
         public_expls_msg = generate_public_expls_message(public_exploits)
         send_slack_mesage(cve_message, public_expls_msg)
@@ -403,12 +399,12 @@ def main():
     #Find and publish modified CVEs
     modified_cves = get_modified_cves()
 
-    modified_cves = [mcve for mcve in modified_cves if not mcve['id'] in new_cves_ids]
-    modified_cves_ids = [mcve['id'] for mcve in modified_cves]
+    modified_cves = [mcve for mcve in modified_cves if not mcve["cveMetadata"]['cveId'] in new_cves_ids]
+    modified_cves_ids = [mcve["cveMetadata"]['cveId'] for mcve in modified_cves]
     print(f"Modified CVEs discovered: {modified_cves_ids}")
 
     for modified_cve in modified_cves:
-        public_exploits = search_exploits(modified_cve['id'])
+        public_exploits = search_exploits(modified_cve["cveMetadata"]['cveId'])
         cve_message = generate_modified_cve_message(modified_cve)
         public_expls_msg = generate_public_expls_message(public_exploits)
         send_slack_mesage(cve_message, public_expls_msg)
